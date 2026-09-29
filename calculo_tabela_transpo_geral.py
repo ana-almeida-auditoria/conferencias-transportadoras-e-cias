@@ -20,7 +20,7 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 # =============================================================================
 DATA_INICIAL = "2026-08-17"   # período de busca (data_entrada)
 DATA_FINAL   = "2026-09-23"
-FORNECEDOR   = ["31432"]            # id do fornecedor (notas.fornecedor / fornecedores.id_local) aa
+FORNECEDOR   = ["31432"]            # id do fornecedor (notas.fornecedor / fornecedores.id_local) 
 
 ARQUIVO_SAIDA = "C:\\Users\\ana.almeida\\Downloads\\resultado_tabela_cia.xlsx"
 
@@ -441,6 +441,7 @@ def main():
         tf.excedente
     FROM tabela_faixas tf
     WHERE tf.id_trecho IN ({fmt})
+    AND tf.deleted_at IS NULL
     ORDER BY tf.id_trecho, tf.tipo, tf.indice
     """
     cursor.execute(SQL_FAIXAS, ids_trecho)

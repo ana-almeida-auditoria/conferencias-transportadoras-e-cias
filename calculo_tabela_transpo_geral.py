@@ -20,7 +20,7 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 # =============================================================================
 DATA_INICIAL = "2026-08-17"   # período de busca (data_entrada)
 DATA_FINAL   = "2026-09-23"
-FORNECEDOR   = ["31432"]            # id do fornecedor (notas.fornecedor / fornecedores.id_local)
+FORNECEDOR   = ["31432"]            # id do fornecedor (notas.fornecedor / fornecedores.id_local) aa
 
 ARQUIVO_SAIDA = "C:\\Users\\ana.almeida\\Downloads\\resultado_tabela_cia.xlsx"
 

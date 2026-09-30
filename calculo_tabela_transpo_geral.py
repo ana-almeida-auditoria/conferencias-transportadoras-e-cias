@@ -5,6 +5,7 @@
 # =============================================================================
 
 import math
+from tkinter import ON
 import pandas as pd
 import os
 from dotenv import load_dotenv
@@ -18,9 +19,9 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 # =============================================================================
 # CONFIGURAÇÕES
 # =============================================================================
-DATA_INICIAL = "2026-08-17"   # período de busca (data_entrada)
-DATA_FINAL   = "2026-09-23"
-FORNECEDOR   = ["31432"]            # id do fornecedor (notas.fornecedor / fornecedores.id_local) 
+DATA_INICIAL = "2026-09-01"   # período de busca (data_entrada)
+DATA_FINAL   = "2026-09-25"
+FORNECEDOR   = ["588319"]            # id do fornecedor (notas.fornecedor / fornecedores.id_local) 
 
 ARQUIVO_SAIDA = "C:\\Users\\ana.almeida\\Downloads\\resultado_tabela_cia.xlsx"
 
@@ -332,6 +333,7 @@ def main():
     #
     # Origem so bate por rota ou UF. Destino pode bater por rota, UF ou zona
     # (tabela_trecho.destino = cidade_zona_grupo.id_zona -> cidade_zona_grupo.id_rota).
+
     SQL_NOTAS_TRECHO = """
     SELECT
         n.id_nota,
@@ -362,6 +364,7 @@ def main():
     LEFT JOIN personalizados.vigencia_tabela_awb dbv
         ON dbv.id_fornecedor = f.id_local
         AND dbv.data_inicial <= n.data_entrada
+        AND (dbv.data_final >= n.data_entrada OR dbv.data_final IS NULL)
     LEFT JOIN fornecedores f_dest
         ON f_dest.id_local = n.destinatario
     INNER JOIN aero a_orig
@@ -493,21 +496,21 @@ def main():
             "ID TABELA":        id_tabela,
             "PESO":             peso,
             "ID TRECHO":        id_trecho,
-            "PERCENTUAL FRETE": percentual_frete,
-            "TDE":              round(calc["tde"], 2),
             "VALOR TABELA":     round(calc["valor_final"], 2),
             "DIFERENÇA":        round(calc["valor_final"] - nf_total, 2),
+            "TDE":              round(calc["tde"], 2),
+            "PERCENTUAL FRETE": percentual_frete,
             # --- DEBUG (temporario, remover depois de validar) ---
             # "DEBUG_TIPOS_ENCONTRADOS": ",".join(str(t) for t in sorted(faixas_por_tipo.keys())),
             # "DEBUG_TIPO_1":  round(calc["por_tipo"].get(1,  0), 2),
-            # "DEBUG_TIPO_4":  round(calc["por_tipo"].get(4,  0), 2),
-            # "DEBUG_TIPO_5":  round(calc["por_tipo"].get(5,  0), 2),
-            # "DEBUG_TIPO_6":  round(calc["por_tipo"].get(6,  0), 2),
-            # "DEBUG_TIPO_8":  round(calc["por_tipo"].get(8,  0), 2),
+            #"DEBUG_TIPO_ADV":  round(calc["por_tipo"].get(4,  0), 2),
+            #"DEBUG_TIPO_GRIS":  round(calc["por_tipo"].get(5,  0), 2),
+            #"DEBUG_TIPO_DESP":  round(calc["por_tipo"].get(6,  0), 2),
+            #"DEBUG_TIPO_FAIXAS":  round(calc["por_tipo"].get(8,  0), 2),
             # "DEBUG_TIPO_11": round(calc["por_tipo"].get(11, 0), 2),
-            # "DEBUG_TIPO_14": round(calc["por_tipo"].get(14, 0), 2),
+            #"DEBUG_TIPO_PEDAGIO": round(calc["por_tipo"].get(14, 0), 2),
             # "DEBUG_TIPO_23": round(calc["por_tipo"].get(23, 0), 2),
-            # "DEBUG_TIPO_32": round(calc["por_tipo"].get(32, 0), 2), 
+            #"DEBUG_TIPO_ADV": round(calc["por_tipo"].get(32, 0), 2), 
         })
 
     df_resultado = pd.DataFrame(resultados)
@@ -516,7 +519,7 @@ def main():
     # -------------------------------------------------------------------------
     # QUERY: dados complementares de db_awb (mesmo padrão do main antigo)
     # -------------------------------------------------------------------------
-    ids_awb = df_resultado["AWB"].dropna().tolist()
+    ids_awb = df_resultado["ID NOTA"].dropna().tolist()
 
     if ids_awb:
         fmt_awb  = ",".join(["%s"] * len(ids_awb))
@@ -531,24 +534,31 @@ def main():
             da.status_awb
         FROM personalizados.db_awb da
         WHERE da.cod_awb IN ({fmt_awb})
+        
         """
         cursor.execute(SQL_DAWB, ids_awb)
         rows_dawb = cursor.fetchall()
     else:
         rows_dawb = []
 
-    df_dawb = pd.DataFrame(rows_dawb)
+    df_dawb = pd.DataFrame(rows_dawb, columns=[
+        "cod_awb",
+        "emissao_awb",
+        "origem",
+        "destino",
+        "servico_awb",
+        "status_awb",
+    ])
     print(f" - df_dawb      -> [{df_dawb.shape[0]:,} linhas x {df_dawb.shape[1]} colunas]".replace(",", "."))
 
     # Merge: LEFT para manter AWBs sem registro em db_awb (aparecem com campos vazios)
     if not df_dawb.empty:
-        df_dawb = df_dawb.rename(columns={"cod_awb": "AWB"})
-        df_dawb["AWB"]      = df_dawb["AWB"].astype(str).str.strip()
-        df_resultado["AWB"] = df_resultado["AWB"].astype(str).str.strip()
-        df_resultado = df_resultado.merge(df_dawb, on="AWB", how="left")
+        df_dawb = df_dawb.rename(columns={"cod_awb": "ID NOTA"})
+        df_dawb["ID NOTA"]      = df_dawb["ID NOTA"].astype(str).str.strip()
+        df_resultado["ID NOTA"] = df_resultado["ID NOTA"].astype(str).str.strip()
+        df_resultado = df_resultado.merge(df_dawb, on="ID NOTA", how="left")
         df_resultado = df_resultado.rename(columns={
             "emissao_awb":               "DATA EMISSÃO",
-            "responsavel_transferencia": "RESPONSÁVEL TRANSFERÊNCIA",
             "origem":                    "ORIGEM",
             "destino":                    "DESTINO",
             "servico_awb":               "SERVIÇO AWB",

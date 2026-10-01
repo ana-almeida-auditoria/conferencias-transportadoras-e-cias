@@ -653,7 +653,6 @@ def main():
         SELECT
             da.cod_awb,
             da.emissao_awb,
-            da.responsavel_transferencia,
             da.origem,
             da.destino,
             da.servico_awb,

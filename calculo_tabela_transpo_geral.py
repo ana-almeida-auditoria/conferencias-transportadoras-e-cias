@@ -21,7 +21,7 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 # =============================================================================
 DATA_INICIAL = "2026-09-01"   # período de busca (data_entrada)
 DATA_FINAL   = "2026-09-25"
-FORNECEDOR   = ["588319"]            # id do fornecedor (notas.fornecedor / fornecedores.id_local) 
+FORNECEDOR   = ["169715"]            # id do fornecedor (notas.fornecedor / fornecedores.id_local) 
 
 ARQUIVO_SAIDA = "C:\\Users\\ana.almeida\\Downloads\\resultado_tabela_cia.xlsx"
 
@@ -58,16 +58,22 @@ engine = create_engine(
 # =============================================================================
 # MÓDULO DE CÁLCULO DE TABELA (tipos 1, 4, 5, 6, 8, 11, 14, 23, 32 + TDE(24) + percentual_frete)
 # =============================================================================
-TIPOS_VALIDOS = {1, 4, 5, 6, 8, 11, 14, 23, 32}  # calculados no fluxo normal (calcular_tipos)
+TIPOS_VALIDOS = {1, 4, 5, 6, 8, 11, 14, 22, 23, 25, 32}  # calculados no fluxo normal (calcular_tipos)
 
 TIPOS_ADVALOREM           = {32}        # base = valor_transp; MAX((valor_transp * excedente/100) + franquia, minimo)
 TIPOS_ADVALOREM_DIRETO    = {4, 5}      # base = valor_transp direto (sem ratio)
 TIPOS_FRACAO              = {23}        # CEIL(peso / fracao) * excedente (sem franquia/minimo)
 TIPOS_FRACAO_PROPORCIONAL = {14}        # CEIL(peso / fracao) * excedente (igual tipo 23, sem franquia/minimo)
-TIPOS_NORMAIS             = {1, 6, 8, 11}  # (base - franquia) * excedente + minimo
+TIPOS_NORMAIS             = {1, 6, 8, 11, 22, 25}  # (base - franquia) * excedente + minimo
 # Tipo 6 (Despacho) e mutuamente exclusivo com tipo 1: se o trecho tiver tipo 6, tipo 1 e ignorado.
 
 TIPO_TDE = 24  # calculado FORA do fluxo normal: depende de fornecedores.tad e usa nf_total como base
+
+# --- Desconto por cliente (relatorios.cliente_trecho) ---
+FORNECEDORES_CLIENTE_TRECHO = {"169715"}  # so consulta a cliente_trecho para estes fornecedores (JEM)
+TIPOS_FRETE_PESO = {8}      # com desconto: excedente*(1-desc_peso) + minimo*(1-desc_minimo), somados
+TIPOS_ADV        = {4, 32}  # adv_exc_fixo (> 0) substitui o excedente da faixa
+TIPO_GRIS        = 5        # gris_exc_fixo (> 0) substitui o excedente da faixa
 
 
 def _localizar_faixa(base: float, faixas: list[dict], ratio: float | None = None) -> dict | None:
@@ -94,7 +100,7 @@ def _localizar_faixa(base: float, faixas: list[dict], ratio: float | None = None
     return None
 
 
-def _calcular_faixa(base: float, faixa: dict, tipo: int, ratio: float | None = None) -> float:
+def _calcular_faixa(base: float, faixa: dict, tipo: int, ratio: float | None = None, desc: dict | None = None) -> float:
     """
     Aplica o calculo de uma faixa individual conforme o tipo:
 
@@ -123,10 +129,29 @@ def _calcular_faixa(base: float, faixa: dict, tipo: int, ratio: float | None = N
     Tipo 14 (pedagio por fracao com CEIL):
       resultado = CEIL(peso / fracao) * excedente
       onde fracao = faixa.inicio  (igual tipo 23: sem franquia, sem minimo, com arredondamento para cima)
+
+    desc (linha da relatorios.cliente_trecho, opcional):
+      Frete peso (TIPOS_FRETE_PESO): sem desconto = MAX(excedente, minimo)
+                                     com desconto = excedente * (1 - desconto_frete_peso/100)
+                                                  + minimo    * (1 - desconto_frete_minimo/100)
+      Advalorem (TIPOS_ADV)        : adv_exc_fixo  > 0 substitui o excedente
+      GRIS (TIPO_GRIS)             : gris_exc_fixo > 0 substitui o excedente
     """
     minimo    = float(faixa.get("minimo",    0) or 0)
     franquia  = float(faixa.get("franquia",  0) or 0)
     excedente = float(faixa.get("excedente", 0) or 0)
+
+    fator_exc   = 1.0
+    soma_partes = False
+    if desc:
+        if tipo in TIPOS_FRETE_PESO:
+            soma_partes = True
+            fator_exc = 1 - float(desc.get("desconto_frete_peso")   or 0) / 100
+            minimo   *= 1 - float(desc.get("desconto_frete_minimo") or 0) / 100
+        elif tipo in TIPOS_ADV and float(desc.get("adv_exc_fixo") or 0) > 0:
+            excedente = float(desc["adv_exc_fixo"])
+        elif tipo == TIPO_GRIS and float(desc.get("gris_exc_fixo") or 0) > 0:
+            excedente = float(desc["gris_exc_fixo"])
 
     # --- Tipos 23 e 14: fracao com CEIL (sem franquia/minimo) ---
     if tipo in TIPOS_FRACAO or tipo in TIPOS_FRACAO_PROPORCIONAL:
@@ -159,9 +184,11 @@ def _calcular_faixa(base: float, faixa: dict, tipo: int, ratio: float | None = N
         return minimo
 
     base_exc  = (base - franquia) if franquia  > 0 else base
-    calculado = (base_exc * excedente) if excedente > 0 else 0
+    calculado = (base_exc * excedente * fator_exc) if excedente > 0 else 0
 
     if tipo == 8:
+        if soma_partes:
+            return calculado + minimo
         return max(calculado, minimo) if minimo > 0 else calculado
 
     # Tipos 1, 6, 11: soma minimo
@@ -169,7 +196,7 @@ def _calcular_faixa(base: float, faixa: dict, tipo: int, ratio: float | None = N
     return calculado + Z
 
 
-def calcular_tipos(peso: float, valor_transp: float, faixas_por_tipo: dict[int, list[dict]]) -> dict:
+def calcular_tipos(peso: float, valor_transp: float, faixas_por_tipo: dict[int, list[dict]], desc: dict | None = None) -> dict:
     """
     Recebe o peso e valor_transp do AWB e um dict com as faixas agrupadas por tipo.
     Retorna o resultado de cada tipo e o valor total do trecho antes do aero minimo.
@@ -210,7 +237,7 @@ def calcular_tipos(peso: float, valor_transp: float, faixas_por_tipo: dict[int, 
             resultados[tipo] = 0.0
             continue
 
-        resultados[tipo] = _calcular_faixa(base, faixa_match, tipo, ratio=ratio)
+        resultados[tipo] = _calcular_faixa(base, faixa_match, tipo, ratio=ratio, desc=desc)
 
     # Separa tipos de fracao (23 e 14) dos demais para aplicar aero minimo corretamente.
     # Tipos 23 e 14 ficam fora do aero minimo e sao somados por ultimo.
@@ -279,6 +306,7 @@ def calcular_valor_trecho(
     percentual_frete: float = 0,
     nf_total: float = 0,
     tem_tde: bool = False,
+    desc: dict | None = None,
 ) -> dict:
     """
     Funcao principal do modulo de calculo.
@@ -291,7 +319,7 @@ def calcular_valor_trecho(
     4. valor_com_tde = valor_com_minimo + TDE (tipo 24, somado por fora, so se tem_tde=True)
     5. valor_final = valor_com_tde * (1 + percentual_frete / 100)
     """
-    resultado = calcular_tipos(peso, valor_transp, faixas_por_tipo)
+    resultado = calcular_tipos(peso, valor_transp, faixas_por_tipo, desc=desc)
 
     valor_com_minimo = aplicar_aero_minimo(
         resultado["valor_sem_fracao"],
@@ -309,6 +337,45 @@ def calcular_valor_trecho(
     resultado["valor_com_tde"]    = valor_com_tde
     resultado["valor_final"]      = valor_final
     return resultado
+
+
+def selecionar_cliente_trecho(
+    regras: list[dict],
+    cidade_origem: int,
+    cidade_destino: int,
+    id_servico: int,
+    peso: float,
+    data_entrada,
+) -> dict | None:
+    """
+    Escolhe a linha da relatorios.cliente_trecho para o AWB.
+    id_origem/id_destino = 0 -> qualquer cidade. Prioridade:
+      1 = origem exata  x destino exato
+      2 = origem exata  x destino 0
+      3 = origem 0      x destino exato
+      4 = origem 0      x destino 0
+    Desempate: servico exato antes de servico 0.
+    Filtros: servico (0 ou do AWB), peso_inicio <= peso <= peso_fim, data_entrada <= vigencia (NULL = sem limite).
+    """
+    melhor, melhor_rank = None, None
+    data_ref = data_entrada.date() if hasattr(data_entrada, "date") else data_entrada
+    for r in regras:
+        orig, dest, serv = int(r["id_origem"] or 0), int(r["id_destino"] or 0), int(r["servico"] or 0)
+        if orig not in (0, cidade_origem) or dest not in (0, cidade_destino) or serv not in (0, id_servico):
+            continue
+        p_ini, p_fim = r.get("peso_inicio"), r.get("peso_fim")
+        if (p_ini is not None and peso < float(p_ini)) or (p_fim is not None and peso > float(p_fim)):
+            continue
+        vig = r.get("vigencia")
+        if vig is not None and data_ref is not None:
+            vig = vig.date() if hasattr(vig, "date") else vig
+            if data_ref > vig:
+                continue
+        prioridade = {(True, True): 1, (True, False): 2, (False, True): 3, (False, False): 4}[(orig != 0, dest != 0)]
+        rank = (prioridade, 0 if serv != 0 else 1)
+        if melhor_rank is None or rank < melhor_rank:
+            melhor, melhor_rank = r, rank
+    return melhor
 
 
 # =============================================================================
@@ -349,6 +416,9 @@ def main():
         tt.id_trecho,
         tt.aero_minimo,
         tt.percentual_frete,
+        a_orig.cidade      AS cidade_origem,
+        a_dest.cidade      AS cidade_destino,
+        eq.id_equipamento  AS id_servico,
         CASE
             WHEN r_orig.id_rota      IS NOT NULL AND r_dest.id_rota      IS NOT NULL THEN 1
             WHEN r_orig_uf.id_rota   IS NOT NULL AND r_dest_uf.id_rota   IS NOT NULL THEN 2
@@ -460,6 +530,41 @@ def main():
     print(f" - faixas       -> [{len(rows_faixas):,} registros carregados]".replace(",", "."))
 
     # -------------------------------------------------------------------------
+    # QUERY: descontos por cliente (relatorios.cliente_trecho)
+    # -------------------------------------------------------------------------
+    ids_cliente = list({r["id_fornecedor"] for r in mapa_notas.values() if str(r["id_fornecedor"]) in FORNECEDORES_CLIENTE_TRECHO})
+    fmt_cli     = ",".join(["%s"] * len(ids_cliente))
+    SQL_CLIENTE_TRECHO = f"""
+    SELECT
+        ct.id_trecho_cliente,
+        ct.id_cliente,
+        ct.id_origem,
+        ct.id_destino,
+        ct.servico,
+        ct.peso_inicio,
+        ct.peso_fim,
+        ct.vigencia,
+        ct.desconto_frete_peso,
+        ct.desconto_frete_minimo,
+        ct.adv_exc_fixo,
+        ct.gris_exc_fixo
+    FROM relatorios.cliente_trecho ct
+    WHERE ct.id_cliente IN ({fmt_cli})
+        AND ct.status = 1
+    """
+    if ids_cliente:
+        cursor.execute(SQL_CLIENTE_TRECHO, ids_cliente)
+        rows_cliente = cursor.fetchall()
+    else:
+        rows_cliente = []
+
+    regras_cliente: dict[int, list[dict]] = {}
+    for r in rows_cliente:
+        regras_cliente.setdefault(int(r["id_cliente"]), []).append(r)
+
+    print(f" - cliente_trecho -> [{len(rows_cliente):,} registros carregados]".replace(",", "."))
+
+    # -------------------------------------------------------------------------
     # CÁLCULO DO VALOR DE TABELA POR AWB
     # -------------------------------------------------------------------------
     resultados = []
@@ -478,6 +583,15 @@ def main():
 
         tem_tde = int(dados.get("tad") or 0) == 1
 
+        desc = selecionar_cliente_trecho(
+            regras_cliente.get(int(dados["id_fornecedor"]), []),
+            int(dados["cidade_origem"]  or 0),
+            int(dados["cidade_destino"] or 0),
+            int(dados["id_servico"]     or 0),
+            peso,
+            dados["data_entrada"],
+        )
+
         calc = calcular_valor_trecho(
             peso,
             valor_transp,
@@ -486,7 +600,17 @@ def main():
             percentual_frete=percentual_frete,
             nf_total=nf_total,
             tem_tde=tem_tde,
+            desc=desc,
         )
+        calc_cheio = calcular_valor_trecho(
+            peso,
+            valor_transp,
+            aero_minimo,
+            faixas_por_tipo,
+            percentual_frete=percentual_frete,
+            nf_total=nf_total,
+            tem_tde=tem_tde,
+        ) if desc else calc
 
         resultados.append({
             "AWB":              dados["awb"],
@@ -496,6 +620,8 @@ def main():
             "ID TABELA":        id_tabela,
             "PESO":             peso,
             "ID TRECHO":        id_trecho,
+            "ID TRECHO CLIENTE": desc["id_trecho_cliente"] if desc else None,
+            "VALOR TABELA SEM DESCONTO": round(calc_cheio["valor_final"], 2),
             "VALOR TABELA":     round(calc["valor_final"], 2),
             "DIFERENÇA":        round(calc["valor_final"] - nf_total, 2),
             "TDE":              round(calc["tde"], 2),

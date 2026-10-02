@@ -5,25 +5,26 @@
 # =============================================================================
 
 import math
-from tkinter import ON
-import pandas as pd
 import os
-from dotenv import load_dotenv
+import re
+from collections import defaultdict
 from pathlib import Path
+
+import pandas as pd
 import mysql.connector
+from dotenv import load_dotenv
 from mysql.connector import Error
-from sqlalchemy import create_engine
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
 # =============================================================================
 # CONFIGURAÇÕES
 # =============================================================================
 DATA_INICIAL = "2026-09-01"   # período de busca (data_entrada)
-DATA_FINAL   = "2026-09-25"
-FORNECEDOR   = ["169715"]            # id do fornecedor (notas.fornecedor / fornecedores.id_local) 
+DATA_FINAL   = "2026-09-05"
+FORNECEDOR   = ["169715"]            # id do fornecedor (notas.fornecedor / fornecedores.id_local)
 
-ARQUIVO_SAIDA = "C:\\Users\\ana.almeida\\Downloads\\resultado_tabela_cia.xlsx"
+ARQUIVO_SAIDA = "C:\\Users\\ana.almeida\\Downloads\\resultado_tabela_cia_v2.xlsx"
+
+TAM_BLOCO = 2000   # máximo de ids por IN (...) em cada consulta
 
 
 # =============================================================================
@@ -48,12 +49,6 @@ def conectar_mysql():
     except Error as e:
         print(f"Erro ao conectar: {e}")
         return None
-
-# exemplo com sqlalchemy
-engine = create_engine(
-    f"mysql+mysqlconnector://{DB_CONFIG['user']}:{DB_CONFIG['password']}"
-    f"@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
-)
 
 # =============================================================================
 # MÓDULO DE CÁLCULO DE TABELA (tipos 1, 4, 5, 6, 8, 11, 14, 23, 32 + TDE(24) + percentual_frete)
@@ -339,30 +334,37 @@ def calcular_valor_trecho(
     return resultado
 
 
-def selecionar_cliente_trecho(
-    regras: list[dict],
-    cidade_origem: int,
-    cidade_destino: int,
-    id_servico: int,
-    peso: float,
-    data_entrada,
-) -> dict | None:
+# =============================================================================
+# CLIENTE_TRECHO: seleção do desconto (candidatas cacheadas por rota/serviço)
+# =============================================================================
+def candidatas_cliente_trecho(regras: list[dict], cidade_origem: int, cidade_destino: int, id_servico: int) -> list[dict]:
     """
-    Escolhe a linha da relatorios.cliente_trecho para o AWB.
-    id_origem/id_destino = 0 -> qualquer cidade. Prioridade:
+    Regras da relatorios.cliente_trecho compatíveis com origem/destino/serviço do AWB,
+    ordenadas da melhor para a pior. id_origem/id_destino = 0 -> qualquer cidade. Prioridade:
       1 = origem exata  x destino exato
       2 = origem exata  x destino 0
       3 = origem 0      x destino exato
       4 = origem 0      x destino 0
-    Desempate: servico exato antes de servico 0.
-    Filtros: servico (0 ou do AWB), peso_inicio <= peso <= peso_fim, data_entrada <= vigencia (NULL = sem limite).
+    Desempate: servico exato antes de servico 0 (e, persistindo o empate, ordem de leitura).
     """
-    melhor, melhor_rank = None, None
-    data_ref = data_entrada.date() if hasattr(data_entrada, "date") else data_entrada
+    achadas = []
     for r in regras:
         orig, dest, serv = int(r["id_origem"] or 0), int(r["id_destino"] or 0), int(r["servico"] or 0)
         if orig not in (0, cidade_origem) or dest not in (0, cidade_destino) or serv not in (0, id_servico):
             continue
+        prioridade = {(True, True): 1, (True, False): 2, (False, True): 3, (False, False): 4}[(orig != 0, dest != 0)]
+        achadas.append(((prioridade, 0 if serv != 0 else 1), r))
+    achadas.sort(key=lambda x: x[0])  # sort estável
+    return [r for _, r in achadas]
+
+
+def selecionar_cliente_trecho(candidatas: list[dict], peso: float, data_entrada) -> dict | None:
+    """
+    Primeira candidata (já ordenada por prioridade) que atende aos filtros:
+    peso_inicio <= peso <= peso_fim e data_entrada <= vigencia (NULL = sem limite).
+    """
+    data_ref = data_entrada.date() if hasattr(data_entrada, "date") else data_entrada
+    for r in candidatas:
         p_ini, p_fim = r.get("peso_inicio"), r.get("peso_fim")
         if (p_ini is not None and peso < float(p_ini)) or (p_fim is not None and peso > float(p_fim)):
             continue
@@ -371,11 +373,174 @@ def selecionar_cliente_trecho(
             vig = vig.date() if hasattr(vig, "date") else vig
             if data_ref > vig:
                 continue
-        prioridade = {(True, True): 1, (True, False): 2, (False, True): 3, (False, False): 4}[(orig != 0, dest != 0)]
-        rank = (prioridade, 0 if serv != 0 else 1)
-        if melhor_rank is None or rank < melhor_rank:
-            melhor, melhor_rank = r, rank
+        return r
+    return None
+
+
+# =============================================================================
+# TRECHO: match origem/destino feito em Python (sem JOIN explosivo no banco)
+# =============================================================================
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def consultar_em_blocos(cursor, sql: str, ids) -> list[dict]:
+    """Executa `sql` (com o marcador {ph}) em blocos de TAM_BLOCO ids e concatena as linhas."""
+    ids, linhas = list(ids), []
+    for i in range(0, len(ids), TAM_BLOCO):
+        bloco = ids[i:i + TAM_BLOCO]
+        cursor.execute(sql.format(ph=",".join(["%s"] * len(bloco))), bloco)
+        linhas.extend(cursor.fetchall())
+    return linhas
+
+
+def melhor_trecho(trechos: list[dict], cidade_origem, cidade_destino, rotas_uf: dict, zonas: dict):
+    """
+    Prioridade de match origem/destino (mesma regra da query antiga):
+      1 = origem rota x destino rota          4 = origem rota x destino zona
+      2 = origem UF   x destino UF            5 = origem UF   x destino zona
+      3 = origem rota x destino UF (ou UF x rota)   6 = demais (origem 0 ou destino 0)
+    Origem so bate por rota ou UF (ou 0). Destino bate por rota, UF, zona (ou 0).
+    Desempate determinístico: menor id_trecho.
+    """
+    rota_o, rota_d = cidade_origem in rotas_uf, cidade_destino in rotas_uf
+    ufs_o,  ufs_d  = rotas_uf.get(cidade_origem, ()), rotas_uf.get(cidade_destino, ())
+    zonas_d        = zonas.get(cidade_destino, ())
+    melhor = None
+    for tt in trechos:
+        o, d = tt["origem"], tt["destino"]
+        if o is None or d is None:
+            continue
+        o_rota, o_uf = rota_o and o == cidade_origem,  o in ufs_o
+        d_rota, d_uf, d_zona = rota_d and d == cidade_destino, d in ufs_d, d in zonas_d
+        if not (o == 0 or o_rota or o_uf):
+            continue
+        if not (d == 0 or d_rota or d_uf or d_zona):
+            continue
+        if o_rota and d_rota:
+            p = 1
+        elif o_uf and d_uf:
+            p = 2
+        elif (o_rota and d_uf) or (o_uf and d_rota):
+            p = 3
+        elif o_rota and d_zona:
+            p = 4
+        elif o_uf and d_zona:
+            p = 5
+        else:
+            p = 6
+        chave = (p, tt["id_trecho"])
+        if melhor is None or chave < melhor[0]:
+            melhor = (chave, tt)
     return melhor
+
+
+# =============================================================================
+# EXPORTAÇÃO XLSX (padrão skyu-formatacao-xlsx)
+# =============================================================================
+FORMATOS = {
+    "text":      None,
+    "int":       None,
+    "inteiro":   "#,##0_ ;[Red]-#,##0 ",
+    "decimal":   "#,##0.00_ ;[Red]-#,##0.00 ",
+    "moeda":     "R$ #,##0.00_ ;[Red]-R$ #,##0.00 ",
+    "pct":       "0.0%_ ;[Red]-0.0% ",
+    "data":      "dd/mm/yyyy",
+    "data_hora": "dd/mm/yyyy hh:mm",
+}
+
+CENTER  = {"left": "left", "mid": "center", "right": "right"}
+DEFAULT = {"format": "text", "size": 8.0, "center": "left"}
+
+
+def _montar_abas(df_resultado: pd.DataFrame) -> dict:
+    return {
+        "Resultado": {
+            "df": df_resultado, "sort_col": "cod_awb",
+            "cols": """
+                awb                         size:14    center:mid
+                cod_awb                     format:int      size:11    center:mid
+                fornecedor                  size:28    center:left
+                valor_cobrado               format:decimal  size:15    center:mid
+                id_tabela                   format:int      size:11    center:mid
+                peso                        format:decimal  size:11    center:mid
+                id_trecho                   format:int      size:11    center:mid
+                valor_tabela                format:decimal  size:14    center:mid
+                diferença                   format:decimal  size:13    center:mid
+                data_emissão                format:data     size:14    center:mid
+                origem                      size:10    center:mid
+                destino                     size:10    center:mid
+                serviço_awb                 size:14    center:mid
+                status                      size:12    center:mid
+            """,
+        },
+    }
+
+
+_RE_TOKEN = re.compile(r"(format|size|center)\s*:\s*(\S+)", re.IGNORECASE)
+
+
+def _parse_cols(spec, nome_aba=""):
+    cfg = {}
+    for n_linha, linha in enumerate((spec or "").splitlines(), 1):
+        linha = linha.split("#")[0].strip()
+        if not linha:
+            continue
+        tokens = list(_RE_TOKEN.finditer(linha))
+        col = (linha[:tokens[0].start()] if tokens else linha).strip()
+        if not col:
+            raise ValueError(f"[{nome_aba}] linha {n_linha}: falta o nome da coluna")
+        d = dict(DEFAULT)
+        for t in tokens:
+            chave, valor = t.group(1).lower(), t.group(2).lower()
+            d[chave] = float(valor) if chave == "size" else valor
+        if d["format"] not in FORMATOS:
+            raise ValueError(f"[{nome_aba}] '{col}': format '{d['format']}' inválido. Use: {', '.join(FORMATOS)}")
+        if d["center"] not in CENTER:
+            raise ValueError(f"[{nome_aba}] '{col}': center '{d['center']}' inválido. Use: {', '.join(CENTER)}")
+        cfg[col] = d
+    return cfg
+
+
+def formatar_aba(ws, wb, df, cols_cfg=None):
+    cols_cfg = cols_cfg or {}
+    _fmt_cache = {}
+
+    def _get_fmt(align, num_format):
+        key = (align, num_format)
+        if key not in _fmt_cache:
+            props = {"align": align, "valign": "vcenter"}
+            if num_format:
+                props["num_format"] = num_format
+            _fmt_cache[key] = wb.add_format(props)
+        return _fmt_cache[key]
+
+    def snake_to_titulo(col):
+        return col.replace("_", " ").upper()
+
+    fmt_header = wb.add_format({
+        "bold": True, "font_color": "#FFFFFF", "bg_color": "#261957",
+        "align": "center", "valign": "vcenter", "text_wrap": True,
+    })
+
+    cols, n_rows = list(df.columns), len(df)
+
+    ws.set_row(0, 30)
+    for c_idx, col in enumerate(cols):
+        ws.write(0, c_idx, snake_to_titulo(col), fmt_header)
+
+    for c_idx, col in enumerate(cols):
+        cfg = cols_cfg.get(col, DEFAULT)
+        fmt = _get_fmt(CENTER[cfg["center"]], FORMATOS[cfg["format"]])
+        ws.set_column(c_idx, c_idx, cfg["size"], fmt)
+        if n_rows and pd.api.types.is_datetime64_any_dtype(df[col]):
+            valores = [None if pd.isna(v) else v.to_pydatetime() for v in df[col]]
+            ws.write_column(1, c_idx, valores, fmt)
+
+    ws.autofilter(0, 0, n_rows, len(cols) - 1)
 
 
 # =============================================================================
@@ -389,19 +554,10 @@ def main():
     cursor = conn.cursor(dictionary=True)
 
     # -------------------------------------------------------------------------
-    # QUERY PRINCIPAL: notas do período/fornecedor + fornecedor + trecho (com prioridade)
+    # QUERY 1: notas do período/fornecedor (sem tabela_trecho — o match é feito em Python)
     # -------------------------------------------------------------------------
-    # Prioridade de match origem/destino:
-    #   1 = origem rota    x destino rota
-    #   2 = origem UF      x destino UF
-    #   3 = origem rota    x destino UF   (ou origem UF x destino rota)
-    #   4 = origem rota    x destino zona
-    #   5 = origem UF      x destino zona
-    #
-    # Origem so bate por rota ou UF. Destino pode bater por rota, UF ou zona
-    # (tabela_trecho.destino = cidade_zona_grupo.id_zona -> cidade_zona_grupo.id_rota).
-
-    SQL_NOTAS_TRECHO = """
+    ph_forn = ",".join(["%s"] * len(FORNECEDOR))
+    SQL_NOTAS = f"""
     SELECT
         n.id_nota,
         n.awb,
@@ -409,99 +565,112 @@ def main():
         n.peso,
         n.nf_total,
         n.valor_transp,
-        f.id_local        AS id_fornecedor,
+        f.id_local         AS id_fornecedor,
         f.fantasia         AS fornecedor_nome,
-        dbv.tabela AS id_tabela,
+        dbv.tabela         AS id_tabela,
         f_dest.tad         AS tad,
-        tt.id_trecho,
-        tt.aero_minimo,
-        tt.percentual_frete,
         a_orig.cidade      AS cidade_origem,
         a_dest.cidade      AS cidade_destino,
-        eq.id_equipamento  AS id_servico,
-        CASE
-            WHEN r_orig.id_rota      IS NOT NULL AND r_dest.id_rota      IS NOT NULL THEN 1
-            WHEN r_orig_uf.id_rota   IS NOT NULL AND r_dest_uf.id_rota   IS NOT NULL THEN 2
-            WHEN r_orig.id_rota      IS NOT NULL AND r_dest_uf.id_rota   IS NOT NULL THEN 3
-            WHEN r_orig_uf.id_rota   IS NOT NULL AND r_dest.id_rota      IS NOT NULL THEN 3
-            WHEN r_orig.id_rota      IS NOT NULL AND r_dest_zona.id_rota IS NOT NULL THEN 4
-            WHEN r_orig_uf.id_rota   IS NOT NULL AND r_dest_zona.id_rota IS NOT NULL THEN 5
-            ELSE 6
-        END AS prioridade_trecho
+        eq.id_equipamento  AS id_servico
     FROM notas n
-    INNER JOIN fornecedores f
-        ON f.id_local = n.fornecedor
-    LEFT JOIN personalizados.vigencia_tabela_awb dbv
+    INNER JOIN fornecedores f ON f.id_local = n.fornecedor
+    INNER JOIN personalizados.vigencia_tabela_awb dbv
         ON dbv.id_fornecedor = f.id_local
         AND dbv.data_inicial <= n.data_entrada
         AND (dbv.data_final >= n.data_entrada OR dbv.data_final IS NULL)
-    LEFT JOIN fornecedores f_dest
-        ON f_dest.id_local = n.destinatario
-    INNER JOIN aero a_orig
-        ON a_orig.id_aero = n.origem
-    INNER JOIN aero a_dest
-        ON a_dest.id_aero = n.destino
-    INNER JOIN equipamento eq
-        ON eq.servico_cia = n.servico
-    INNER JOIN tabela_trecho tt
-        ON tt.servico    = eq.id_equipamento
-        AND tt.id_tabela = dbv.tabela
-        AND tt.status    = 1
-        AND (
-            tt.origem = 0
-            OR EXISTS (SELECT 1 FROM rotas r WHERE r.id_rota = tt.origem AND r.id_rota = a_orig.cidade)
-            OR EXISTS (SELECT 1 FROM rotas r WHERE r.uf_ibge = tt.origem AND r.id_rota = a_orig.cidade)
-        )
-        AND (
-            tt.destino = 0
-            OR EXISTS (SELECT 1 FROM rotas r WHERE r.id_rota = tt.destino AND r.id_rota = a_dest.cidade)
-            OR EXISTS (SELECT 1 FROM rotas r WHERE r.uf_ibge = tt.destino AND r.id_rota = a_dest.cidade)
-            OR EXISTS (SELECT 1 FROM cidade_zona_grupo czg WHERE czg.id_zona = tt.destino AND czg.id_rota = a_dest.cidade)
-        )
-    LEFT JOIN rotas r_orig
-        ON r_orig.id_rota      = tt.origem  AND r_orig.id_rota      = a_orig.cidade
-    LEFT JOIN rotas r_orig_uf
-        ON r_orig_uf.uf_ibge   = tt.origem  AND r_orig_uf.id_rota   = a_orig.cidade
-    LEFT JOIN rotas r_dest
-        ON r_dest.id_rota      = tt.destino AND r_dest.id_rota      = a_dest.cidade
-    LEFT JOIN rotas r_dest_uf
-        ON r_dest_uf.uf_ibge   = tt.destino AND r_dest_uf.id_rota   = a_dest.cidade
-    LEFT JOIN cidade_zona_grupo r_dest_zona
-        ON r_dest_zona.id_zona = tt.destino AND r_dest_zona.id_rota = a_dest.cidade
-    WHERE
-        n.data_entrada BETWEEN %s AND %s
-        AND n.fornecedor = %s
-    ORDER BY
-        n.id_nota,
-        prioridade_trecho ASC
+    LEFT JOIN fornecedores f_dest ON f_dest.id_local = n.destinatario
+    INNER JOIN aero a_orig ON a_orig.id_aero = n.origem
+    INNER JOIN aero a_dest ON a_dest.id_aero = n.destino
+    INNER JOIN equipamento eq ON eq.servico_cia = n.servico
+    WHERE n.data_entrada BETWEEN %s AND %s
+        AND n.fornecedor IN ({ph_forn})
+    ORDER BY n.id_nota
     """
-
-    placeholders = ",".join(["%s"] * len(FORNECEDOR))
-    sql = SQL_NOTAS_TRECHO.replace("n.fornecedor = %s", f"n.fornecedor IN ({placeholders})")
-    cursor.execute(sql, (DATA_INICIAL, DATA_FINAL, *FORNECEDOR))
+    cursor.execute(SQL_NOTAS, (DATA_INICIAL, DATA_FINAL, *FORNECEDOR))
     rows_notas = cursor.fetchall()
+    print(f" - notas (brutas) -> [{len(rows_notas):,} linhas]".replace(",", "."))
 
-    # Mantém apenas o melhor trecho por AWB (menor prioridade numérica = melhor match)
-    mapa_notas = {}
+    if not rows_notas:
+        cursor.close()
+        conn.close()
+        raise SystemExit("⚠️  Nenhum AWB encontrado para o período/fornecedor informado.")
+
+    # -------------------------------------------------------------------------
+    # QUERY 2-4: trechos das tabelas vigentes, rotas (UF) e zonas — tabelas pequenas
+    # -------------------------------------------------------------------------
+    ids_tabela  = {r["id_tabela"] for r in rows_notas}
+    cidades_ref = {_int(r["cidade_origem"]) for r in rows_notas} | {_int(r["cidade_destino"]) for r in rows_notas}
+    cidades_ref.discard(None)
+    cidades_dst = {_int(r["cidade_destino"]) for r in rows_notas}
+    cidades_dst.discard(None)
+
+    rows_tt = consultar_em_blocos(cursor, """
+    SELECT
+        tt.id_trecho,
+        tt.id_tabela,
+        tt.servico,
+        tt.origem,
+        tt.destino,
+        tt.aero_minimo,
+        tt.percentual_frete
+    FROM tabela_trecho tt
+    WHERE tt.status = 1
+        AND tt.id_tabela IN ({ph})
+    """, ids_tabela)
+
+    trechos_por: dict[tuple, list[dict]] = defaultdict(list)
+    for t in rows_tt:
+        t["origem"], t["destino"] = _int(t["origem"]), _int(t["destino"])
+        trechos_por[(str(t["id_tabela"]), _int(t["servico"]))].append(t)
+
+    rotas_uf: dict[int, set] = defaultdict(set)
+    for r in consultar_em_blocos(cursor, "SELECT r.id_rota, r.uf_ibge FROM rotas r WHERE r.id_rota IN ({ph})", cidades_ref):
+        rotas_uf[int(r["id_rota"])].add(_int(r["uf_ibge"]))
+
+    zonas: dict[int, set] = defaultdict(set)
+    for z in consultar_em_blocos(cursor, "SELECT czg.id_zona, czg.id_rota FROM cidade_zona_grupo czg WHERE czg.id_rota IN ({ph})", cidades_dst):
+        zonas[int(z["id_rota"])].add(_int(z["id_zona"]))
+
+    print(f" - tabela_trecho -> [{len(rows_tt):,} trechos | {len(rotas_uf):,} rotas | {len(zonas):,} cidades com zona]".replace(",", "."))
+
+    # Melhor trecho por AWB (menor prioridade; empate -> menor id_trecho).
+    # Resultado só depende de (tabela, serviço, origem, destino) -> cache.
+    cache_trecho: dict[tuple, tuple | None] = {}
+    mapa_notas: dict = {}
     for row in rows_notas:
-        id_nota = row["id_nota"]
-        if id_nota not in mapa_notas:
-            mapa_notas[id_nota] = row
+        tab  = str(row["id_tabela"])
+        serv = _int(row["id_servico"])
+        co, cd = _int(row["cidade_origem"]), _int(row["cidade_destino"])
+        k = (tab, serv, co, cd)
+        if k not in cache_trecho:
+            cache_trecho[k] = melhor_trecho(trechos_por.get((tab, serv), ()), co, cd, rotas_uf, zonas)
+        achado = cache_trecho[k]
+        if achado is None:
+            continue
+        chave, tt = achado
+        atual = mapa_notas.get(row["id_nota"])
+        if atual is None or chave < atual["_chave"]:
+            mapa_notas[row["id_nota"]] = {
+                **row,
+                "id_trecho":        tt["id_trecho"],
+                "aero_minimo":      tt["aero_minimo"],
+                "percentual_frete": tt["percentual_frete"],
+                "_chave":           chave,
+            }
 
     print(f" - notas_trecho -> [{len(mapa_notas):,} AWBs com trecho encontrado]".replace(",", "."))
 
     if not mapa_notas:
         cursor.close()
         conn.close()
-        raise SystemExit("⚠️  Nenhum AWB encontrado para o período/fornecedor informado.")
+        raise SystemExit("⚠️  Nenhum AWB com trecho encontrado para o período/fornecedor informado.")
 
     # -------------------------------------------------------------------------
-    # QUERY: faixas de cada trecho encontrado (filtrado por id_tabela)
+    # QUERY: faixas de cada trecho encontrado (só os tipos que o cálculo usa)
     # -------------------------------------------------------------------------
     ids_trecho = list({r["id_trecho"] for r in mapa_notas.values()})
-
-    fmt        = ",".join(["%s"] * len(ids_trecho))
-    SQL_FAIXAS = f"""
+    tipos_sql  = ",".join(str(t) for t in sorted(TIPOS_VALIDOS | {TIPO_TDE}))
+    rows_faixas = consultar_em_blocos(cursor, f"""
     SELECT
         tf.id_trecho,
         tf.id_tabela,
@@ -513,19 +682,17 @@ def main():
         tf.franquia,
         tf.excedente
     FROM tabela_faixas tf
-    WHERE tf.id_trecho IN ({fmt})
-    AND tf.deleted_at IS NULL
+    WHERE tf.id_trecho IN ({{ph}})
+        AND tf.deleted_at IS NULL
+        AND tf.tipo IN ({tipos_sql})
     ORDER BY tf.id_trecho, tf.tipo, tf.indice
-    """
-    cursor.execute(SQL_FAIXAS, ids_trecho)
-    rows_faixas = cursor.fetchall()
+    """, ids_trecho)
 
     # Agrupa faixas: {(id_trecho, id_tabela): {tipo: [faixas]}}
     faixas_agrupadas: dict[tuple, dict[int, list]] = {}
     for f in rows_faixas:
         chave = (f["id_trecho"], str(f["id_tabela"]))
-        tipo  = int(f["tipo"])
-        faixas_agrupadas.setdefault(chave, {}).setdefault(tipo, []).append(f)
+        faixas_agrupadas.setdefault(chave, {}).setdefault(int(f["tipo"]), []).append(f)
 
     print(f" - faixas       -> [{len(rows_faixas):,} registros carregados]".replace(",", "."))
 
@@ -533,8 +700,7 @@ def main():
     # QUERY: descontos por cliente (relatorios.cliente_trecho)
     # -------------------------------------------------------------------------
     ids_cliente = list({r["id_fornecedor"] for r in mapa_notas.values() if str(r["id_fornecedor"]) in FORNECEDORES_CLIENTE_TRECHO})
-    fmt_cli     = ",".join(["%s"] * len(ids_cliente))
-    SQL_CLIENTE_TRECHO = f"""
+    rows_cliente = consultar_em_blocos(cursor, """
     SELECT
         ct.id_trecho_cliente,
         ct.id_cliente,
@@ -549,14 +715,9 @@ def main():
         ct.adv_exc_fixo,
         ct.gris_exc_fixo
     FROM relatorios.cliente_trecho ct
-    WHERE ct.id_cliente IN ({fmt_cli})
+    WHERE ct.id_cliente IN ({ph})
         AND ct.status = 1
-    """
-    if ids_cliente:
-        cursor.execute(SQL_CLIENTE_TRECHO, ids_cliente)
-        rows_cliente = cursor.fetchall()
-    else:
-        rows_cliente = []
+    """, ids_cliente)
 
     regras_cliente: dict[int, list[dict]] = {}
     for r in rows_cliente:
@@ -568,6 +729,7 @@ def main():
     # CÁLCULO DO VALOR DE TABELA POR AWB
     # -------------------------------------------------------------------------
     resultados = []
+    cache_cand: dict[tuple, list[dict]] = {}
 
     for id_nota, dados in mapa_notas.items():
         nf_total         = float(dados["nf_total"]         or 0)
@@ -578,19 +740,14 @@ def main():
         id_trecho        = dados["id_trecho"]
         id_tabela        = dados["id_tabela"]
 
-        chave           = (id_trecho, str(id_tabela))
-        faixas_por_tipo = faixas_agrupadas.get(chave, {})
-
+        faixas_por_tipo = faixas_agrupadas.get((id_trecho, str(id_tabela)), {})
         tem_tde = int(dados.get("tad") or 0) == 1
 
-        desc = selecionar_cliente_trecho(
-            regras_cliente.get(int(dados["id_fornecedor"]), []),
-            int(dados["cidade_origem"]  or 0),
-            int(dados["cidade_destino"] or 0),
-            int(dados["id_servico"]     or 0),
-            peso,
-            dados["data_entrada"],
-        )
+        id_forn = int(dados["id_fornecedor"])
+        kc = (id_forn, int(dados["cidade_origem"] or 0), int(dados["cidade_destino"] or 0), int(dados["id_servico"] or 0))
+        if kc not in cache_cand:
+            cache_cand[kc] = candidatas_cliente_trecho(regras_cliente.get(id_forn, []), kc[1], kc[2], kc[3])
+        desc = selecionar_cliente_trecho(cache_cand[kc], peso, dados["data_entrada"])
 
         calc = calcular_valor_trecho(
             peso,
@@ -602,135 +759,98 @@ def main():
             tem_tde=tem_tde,
             desc=desc,
         )
-        calc_cheio = calcular_valor_trecho(
-            peso,
-            valor_transp,
-            aero_minimo,
-            faixas_por_tipo,
-            percentual_frete=percentual_frete,
-            nf_total=nf_total,
-            tem_tde=tem_tde,
-        ) if desc else calc
+        # calc_cheio = calcular_valor_trecho(   # reativar junto com "valor_tabela_sem_desconto"
+        #     peso, valor_transp, aero_minimo, faixas_por_tipo,
+        #     percentual_frete=percentual_frete, nf_total=nf_total, tem_tde=tem_tde,
+        # ) if desc else calc
 
         resultados.append({
-            "AWB":              dados["awb"],
-            "ID NOTA":          id_nota,
-            "FORNECEDOR":       dados["fornecedor_nome"],
-            "VALOR":            nf_total,
-            "ID TABELA":        id_tabela,
-            "PESO":             peso,
-            "ID TRECHO":        id_trecho,
-            "ID TRECHO CLIENTE": desc["id_trecho_cliente"] if desc else None,
-            "VALOR TABELA SEM DESCONTO": round(calc_cheio["valor_final"], 2),
-            "VALOR TABELA":     round(calc["valor_final"], 2),
-            "DIFERENÇA":        round(calc["valor_final"] - nf_total, 2),
-            "TDE":              round(calc["tde"], 2),
-            "PERCENTUAL FRETE": percentual_frete,
-            # --- DEBUG (temporario, remover depois de validar) ---
-            # "DEBUG_TIPOS_ENCONTRADOS": ",".join(str(t) for t in sorted(faixas_por_tipo.keys())),
-            # "DEBUG_TIPO_1":  round(calc["por_tipo"].get(1,  0), 2),
-            #"DEBUG_TIPO_ADV":  round(calc["por_tipo"].get(4,  0), 2),
-            #"DEBUG_TIPO_GRIS":  round(calc["por_tipo"].get(5,  0), 2),
-            #"DEBUG_TIPO_DESP":  round(calc["por_tipo"].get(6,  0), 2),
-            #"DEBUG_TIPO_FAIXAS":  round(calc["por_tipo"].get(8,  0), 2),
-            # "DEBUG_TIPO_11": round(calc["por_tipo"].get(11, 0), 2),
-            #"DEBUG_TIPO_PEDAGIO": round(calc["por_tipo"].get(14, 0), 2),
-            # "DEBUG_TIPO_23": round(calc["por_tipo"].get(23, 0), 2),
-            #"DEBUG_TIPO_ADV": round(calc["por_tipo"].get(32, 0), 2), 
+            "awb":                       dados["awb"],
+            "cod_awb":                   id_nota,
+            "fornecedor":                dados["fornecedor_nome"],
+            "valor_cobrado":             nf_total,
+            "id_tabela":                 id_tabela,
+            "peso":                      peso,
+            "id_trecho":                 id_trecho,
+            # "id_trecho_cliente":         desc["id_trecho_cliente"] if desc else None,
+            # "valor_tabela_sem_desconto": round(calc_cheio["valor_final"], 2),
+            "valor_tabela":              round(calc["valor_final"], 2),
+            "diferença":                 round(calc["valor_final"] - nf_total, 2),
+            # "tde":                       round(calc["tde"], 2),
+            # "percentual_frete":          percentual_frete,
         })
 
     df_resultado = pd.DataFrame(resultados)
     print(f" - df_resultado -> [{df_resultado.shape[0]:,} linhas x {df_resultado.shape[1]} colunas]".replace(",", "."))
 
     # -------------------------------------------------------------------------
-    # QUERY: dados complementares de db_awb (mesmo padrão do main antigo)
+    # QUERY: dados complementares de db_awb (cod_awb é PK INT)
     # -------------------------------------------------------------------------
-    ids_awb = df_resultado["ID NOTA"].dropna().tolist()
+    rows_dawb = consultar_em_blocos(cursor, """
+    SELECT
+        da.cod_awb,
+        da.emissao_awb,
+        da.origem,
+        da.destino,
+        da.servico_awb,
+        da.status_awb
+    FROM personalizados.db_awb da
+    WHERE da.cod_awb IN ({ph})
+    """, df_resultado["cod_awb"].dropna().tolist())
 
-    if ids_awb:
-        fmt_awb  = ",".join(["%s"] * len(ids_awb))
-        SQL_DAWB = f"""
-        SELECT
-            da.cod_awb,
-            da.emissao_awb,
-            da.origem,
-            da.destino,
-            da.servico_awb,
-            da.status_awb
-        FROM personalizados.db_awb da
-        WHERE da.cod_awb IN ({fmt_awb})
-        
-        """
-        cursor.execute(SQL_DAWB, ids_awb)
-        rows_dawb = cursor.fetchall()
-    else:
-        rows_dawb = []
-
-    df_dawb = pd.DataFrame(rows_dawb, columns=[
-        "cod_awb",
-        "emissao_awb",
-        "origem",
-        "destino",
-        "servico_awb",
-        "status_awb",
-    ])
+    df_dawb = pd.DataFrame(rows_dawb, columns=["cod_awb", "emissao_awb", "origem", "destino", "servico_awb", "status_awb"])
+    df_dawb["emissao_awb"] = pd.to_datetime(df_dawb["emissao_awb"], errors="coerce")
     print(f" - df_dawb      -> [{df_dawb.shape[0]:,} linhas x {df_dawb.shape[1]} colunas]".replace(",", "."))
 
-    # Merge: LEFT para manter AWBs sem registro em db_awb (aparecem com campos vazios)
-    if not df_dawb.empty:
-        df_dawb = df_dawb.rename(columns={"cod_awb": "ID NOTA"})
-        df_dawb["ID NOTA"]      = df_dawb["ID NOTA"].astype(str).str.strip()
-        df_resultado["ID NOTA"] = df_resultado["ID NOTA"].astype(str).str.strip()
-        df_resultado = df_resultado.merge(df_dawb, on="ID NOTA", how="left")
-        df_resultado = df_resultado.rename(columns={
-            "emissao_awb":               "DATA EMISSÃO",
-            "origem":                    "ORIGEM",
-            "destino":                    "DESTINO",
-            "servico_awb":               "SERVIÇO AWB",
-            "status_awb":                "STATUS",
-        })
-
+    # LEFT: mantém AWBs sem registro em db_awb (campos vazios); chave temporária, cod_awb segue com o tipo original
+    df_dawb["_chave"]      = pd.to_numeric(df_dawb["cod_awb"], errors="coerce").astype("Int64")
+    df_resultado["_chave"] = pd.to_numeric(df_resultado["cod_awb"], errors="coerce").astype("Int64")
+    df_resultado = (
+        df_resultado
+        .merge(df_dawb.drop(columns="cod_awb"), on="_chave", how="left")
+        .drop(columns="_chave")
+        .rename(columns={"emissao_awb": "data_emissão", "servico_awb": "serviço_awb", "status_awb": "status"})
+    )
     print(f" - df_resultado -> [{df_resultado.shape[0]:,} linhas x {df_resultado.shape[1]} colunas]".replace(",", "."))
 
-    # -------------------------------------------------------------------------
-    # EXPORTAÇÃO COM FORMATAÇÃO (mesmo padrão visual do main antigo)
-    # -------------------------------------------------------------------------
-    df_resultado.to_excel(ARQUIVO_SAIDA, index=False)
-
-    wb = load_workbook(ARQUIVO_SAIDA)
-    ws = wb.active
-
-    fill_header = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
-    font_header = Font(color="FFFFFF", bold=True)
-    font_body   = Font(color="000000")
-    alinhamento = Alignment(horizontal="center", vertical="center")
-    borda_lado  = Side(style="thin", color="595959")
-    borda       = Border(left=borda_lado, right=borda_lado, top=borda_lado, bottom=borda_lado)
-
-    for cell in ws[1]:
-        cell.fill      = fill_header
-        cell.font      = font_header
-        cell.alignment = alinhamento
-        cell.border    = borda
-
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.font      = font_body
-            cell.alignment = alinhamento
-            cell.border    = borda
-
-    for col in ws.columns:
-        max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col)
-        ws.column_dimensions[col[0].column_letter].width = max_len + 4
-
-    wb.save(ARQUIVO_SAIDA)
-    print(f"\n Arquivo gerado: {ARQUIVO_SAIDA}")
-
-    # -------------------------------------------------------------------------
-    # ENCERRAMENTO
-    # -------------------------------------------------------------------------
     cursor.close()
     conn.close()
+
+    # -------------------------------------------------------------------------
+    # EXPORTAÇÃO (xlsxwriter, dois passos)
+    # -------------------------------------------------------------------------
+    ABAS = _montar_abas(df_resultado)
+
+    with pd.ExcelWriter(
+        ARQUIVO_SAIDA,
+        engine="xlsxwriter",
+        datetime_format="dd/mm/yyyy",
+        date_format="dd/mm/yyyy",
+    ) as writer:
+
+        # PASSO 1 — escrever
+        for nome_aba, cfg in ABAS.items():
+            _df = cfg["df"]
+            if cfg.get("sort_col"):
+                _df = _df.sort_values(cfg["sort_col"], na_position="last").reset_index(drop=True)
+            _df.to_excel(writer, sheet_name=nome_aba, index=False)
+            ABAS[nome_aba]["_df_sorted"] = _df
+
+        # PASSO 2 — formatar
+        wb = writer.book
+        for nome_aba, cfg in ABAS.items():
+            _df       = cfg["_df_sorted"]
+            _cols_cfg = _parse_cols(cfg.get("cols", ""), nome_aba)
+            _fantasma = [c for c in _cols_cfg if c not in _df.columns]
+            if _fantasma:
+                print(f"⚠ [{nome_aba}] coluna declarada e inexistente no df: {', '.join(_fantasma)}")
+            formatar_aba(writer.sheets[nome_aba], wb, _df, cols_cfg=_cols_cfg)
+
+    print("Exportado:")
+    for nome_aba, cfg in ABAS.items():
+        _df = cfg["_df_sorted"]
+        print(f" - {'df_resultado':<27} -> [{_df.shape[0]:,} linhas x {_df.shape[1]} colunas]".replace(",", "."))
+    print(f"\n✔ {ARQUIVO_SAIDA}")
 
 
 if __name__ == "__main__":

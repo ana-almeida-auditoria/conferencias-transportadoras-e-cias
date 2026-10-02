@@ -18,11 +18,11 @@ from mysql.connector import Error
 # =============================================================================
 # CONFIGURAÇÕES
 # =============================================================================
-DATA_INICIAL = "2026-09-01"   # período de busca (data_entrada)
-DATA_FINAL   = "2026-09-05"
-FORNECEDOR   = ["169715"]            # id do fornecedor (notas.fornecedor / fornecedores.id_local)
+DATA_INICIAL = "2026-08-20"   # período de busca (data_entrada)
+DATA_FINAL   = "2026-09-20"
+FORNECEDOR   = ["89", "169715", "91", "47719", "31432", "12414", "588319", "98292"]            # id do fornecedor (notas.fornecedor / fornecedores.id_local)
 
-ARQUIVO_SAIDA = "C:\\Users\\ana.almeida\\Downloads\\resultado_tabela_cia_v2.xlsx"
+ARQUIVO_SAIDA = "C:\\Users\\ana.almeida\\Downloads\\resultado_tabela_cia.xlsx"
 
 TAM_BLOCO = 2000   # máximo de ids por IN (...) em cada consulta
 
@@ -796,6 +796,7 @@ def main():
         da.status_awb
     FROM personalizados.db_awb da
     WHERE da.cod_awb IN ({ph})
+    AND da.status_awb = "ATIVO"
     """, df_resultado["cod_awb"].dropna().tolist())
 
     df_dawb = pd.DataFrame(rows_dawb, columns=["cod_awb", "emissao_awb", "origem", "destino", "servico_awb", "status_awb"])

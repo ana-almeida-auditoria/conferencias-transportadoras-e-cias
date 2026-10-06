@@ -1,8 +1,8 @@
-
 import math
 import os
 import re
 from collections import defaultdict
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -13,11 +13,12 @@ from mysql.connector import Error
 # =============================================================================
 # CONFIGURAÇÕES
 # =============================================================================
-DATA_INICIAL = "2026-08-20"   # período de busca (data_entrada)
-DATA_FINAL   = "2026-09-20"
+DIAS_ATRAS   = 7   # busca apenas o dia (hoje - DIAS_ATRAS)
+DATA_INICIAL = (date.today() - timedelta(days=DIAS_ATRAS)).strftime("%Y-%m-%d")   # período de busca (data_entrada)
+DATA_FINAL   = DATA_INICIAL
 FORNECEDOR   = ["89", "169715", "91", "47719", "31432", "12414", "588319", "98292"]            # id do fornecedor (notas.fornecedor / fornecedores.id_local)
 
-ARQUIVO_SAIDA = "C:\\Users\\ana.almeida\\Downloads\\resultado_tabela_cia.xlsx"
+ARQUIVO_SAIDA = "/home/matheus/arquivos-n8n/awb_resultado.xlsx"
 
 TAM_BLOCO = 2000   # máximo de ids por IN (...) em cada consulta
 
@@ -577,7 +578,7 @@ def main():
     INNER JOIN aero a_orig ON a_orig.id_aero = n.origem
     INNER JOIN aero a_dest ON a_dest.id_aero = n.destino
     INNER JOIN equipamento eq ON eq.servico_cia = n.servico
-    WHERE n.data_entrada BETWEEN %s AND %s
+    WHERE n.data_entrada >= %s AND n.data_entrada < DATE_ADD(%s, INTERVAL 1 DAY)
         AND n.fornecedor IN ({ph_forn})
     ORDER BY n.id_nota
     """
